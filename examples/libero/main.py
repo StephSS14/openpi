@@ -13,6 +13,7 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+import json, pathlib
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -41,6 +42,7 @@ class Args:
     # Utils
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
+    output_dir: str = "data/libero/output"
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -71,6 +73,10 @@ def eval_libero(args: Args) -> None:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+
+    out = pathlib.Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    episodes_path = out / "episodes.jsonl"
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -177,6 +183,17 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Success: {done}")
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+
+            # log current result to json file for use in wandb
+            with open(episodes_path, "a") as f:
+                f.write(json.dumps({
+                    "suite": args.task_suite_name,
+                    "task_id": task_id,
+                    "task": task_description,
+                    "trial": episode_idx,
+                    "success": bool(done),
+                    "steps": t,
+                }) + "\n")
 
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
