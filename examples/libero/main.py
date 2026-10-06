@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+import json
 
 import imageio
 from libero.libero import benchmark
@@ -13,7 +14,11 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
-import json, pathlib
+
+# Safety metrics
+from metrics.scene_classification import get_collidable_geoms, check_support_categories
+from metrics.target_resolution import get_target_geoms, verify as verify_targets
+from metrics.safety_metrics import EpisodeSafetyTracker, aggregate
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -57,8 +62,6 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
-
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
     elif args.task_suite_name == "libero_object":
@@ -76,10 +79,18 @@ def eval_libero(args: Args) -> None:
 
     out = pathlib.Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    # rollout vid
+    video_out_path = out / "videos"
+    pathlib.Path(video_out_path).mkdir(parents=True, exist_ok=True)
+
+    # json logging
     episodes_path = out / "episodes.jsonl"
+    episodes_file = open(episodes_path, "a")
+    all_episode_results = []
 
     # Start evaluation
-    total_episodes, total_successes = 0, 0
+    total_episodes, total_successes, total_collision = 0, 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -90,8 +101,16 @@ def eval_libero(args: Args) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
+        # cheap check if the support and target objects resolved
+        if task_id == 0:
+            check_support_categories(env)   # cheap; catches an unknown fixture category
+            verify_targets(env)             # catches a target matching zero geoms
+
+        target_geoms = get_target_geoms(env)
+        collidable = get_collidable_geoms(env, target_geoms, include_fixtures=True)
+
         # Start episodes
-        task_episodes, task_successes = 0, 0
+        task_episodes, task_successes, task_collision = 0, 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
@@ -101,6 +120,9 @@ def eval_libero(args: Args) -> None:
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
+
+            # Metrics tracker
+            tracker = EpisodeSafetyTracker(env.sim, collidable_geoms=collidable)
 
             # Setup
             t = 0
@@ -157,6 +179,10 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
+
+                    # update metrics after every step (every tick)
+                    tracker.update()
+
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -170,11 +196,16 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
+            safety = tracker.result()
+            if (safety["collision"]):
+                task_collision += 1
+                total_collision += 1
+
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                pathlib.Path(video_out_path) / f"task_{task_id}_ep_{episode_idx}_{task_segment}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
@@ -183,24 +214,41 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Success: {done}")
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+            logging.info(f"Collision: {safety['collision']}")
+            logging.info(f"# collisions: {total_collision} ({total_collision / total_episodes * 100:.1f}%)")
 
             # log current result to json file for use in wandb
-            with open(episodes_path, "a") as f:
-                f.write(json.dumps({
-                    "suite": args.task_suite_name,
-                    "task_id": task_id,
-                    "task": task_description,
-                    "trial": episode_idx,
-                    "success": bool(done),
-                    "steps": t,
-                }) + "\n")
+            record = {
+                "suite": args.task_suite_name,
+                "task_id": task_id,
+                "task": task_description,
+                "trial": episode_idx,
+                "success": bool(done),
+                "steps": t,
+                "collision": safety["collision"],
+                "collision_objects": safety["collision_objects"],
+                "first_collision_step": safety["first_collision_step"],
+            }
+            episodes_file.write(json.dumps(record) + "\n")
+            episodes_file.flush()
+            all_episode_results.append(record)
 
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        logging.info(f"Current task collision rate: {float(task_collision) / float(task_episodes)}")
+        logging.info(f"Current total success rate: {float(total_collision) / float(total_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    logging.info(f"Current total success rate: {float(total_collision) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+    # Save local log file
+    episodes_file.close()
+
+    safety_summary = aggregate(all_episode_results)
+    logging.info(f"Collision rate: {safety_summary['collision_rate']}")
+    logging.info(f"Collision avoidance rate: {safety_summary['collision_avoidance_rate']}")
 
 
 def _get_libero_env(task, resolution, seed):
