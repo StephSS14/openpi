@@ -15,9 +15,11 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
 
+import traceback
+
 # Safety metrics
-from metrics.scene_classification import get_collidable_geoms, check_support_categories
-from metrics.target_resolution import get_target_geoms, verify as verify_targets
+from metrics.scene_classification import check_support_categories
+from metrics.target_resolution import build_collision_config, verify as verify_targets
 from metrics.safety_metrics import EpisodeSafetyTracker, aggregate
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
@@ -84,13 +86,16 @@ def eval_libero(args: Args) -> None:
     video_out_path = out / "videos"
     pathlib.Path(video_out_path).mkdir(parents=True, exist_ok=True)
 
+    gallery_vid_out_path = video_out_path / "gallery"
+    pathlib.Path(gallery_vid_out_path).mkdir(parents=True, exist_ok=True)
+
     # json logging
     episodes_path = out / "episodes.jsonl"
     episodes_file = open(episodes_path, "a")
     all_episode_results = []
 
     # Start evaluation
-    total_episodes, total_successes, total_collision = 0, 0, 0
+    total_episodes, total_successes, total_unintended_contact = 0, 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -106,11 +111,10 @@ def eval_libero(args: Args) -> None:
             check_support_categories(env)   # cheap; catches an unknown fixture category
             verify_targets(env)             # catches a target matching zero geoms
 
-        target_geoms = get_target_geoms(env)
-        collidable = get_collidable_geoms(env, target_geoms, include_fixtures=True)
+        collision_config = build_collision_config(env, include_fixtures=True, extra_ignore=None)
 
         # Start episodes
-        task_episodes, task_successes, task_collision = 0, 0, 0
+        task_episodes, task_successes, task_unintended_contact = 0, 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
@@ -122,11 +126,16 @@ def eval_libero(args: Args) -> None:
             obs = env.set_init_state(initial_states[episode_idx])
 
             # Metrics tracker
-            tracker = EpisodeSafetyTracker(env.sim, collidable_geoms=collidable)
+            # Metrics tracker
+            tracker = EpisodeSafetyTracker(env.sim, 
+                                           collidable_geoms=collision_config["collidable_geoms"],
+                                           destinations_geoms=collision_config["destination_geoms"],
+                                           )
 
             # Setup
             t = 0
             replay_images = []
+            gallery_images = []
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
@@ -136,12 +145,15 @@ def eval_libero(args: Args) -> None:
                     if t < args.num_steps_wait:
                         obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
+                        if t == args.num_steps_wait:
+                            tracker.start()
                         continue
 
                     # Get preprocessed image
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
                     img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
                     wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                    gallery_img = obs["galleryview_image"][::-1]
                     img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
                     )
@@ -151,6 +163,7 @@ def eval_libero(args: Args) -> None:
 
                     # Save preprocessed image for replay video
                     replay_images.append(img)
+                    gallery_images.append(gallery_img)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -190,16 +203,17 @@ def eval_libero(args: Args) -> None:
                     t += 1
 
                 except Exception as e:
-                    logging.error(f"Caught exception: {e}")
+                    traceback.print_exc()
+                    logging.error(f"Caught exception: {e}\n{traceback.format_exc()}\n")
                     break
 
             task_episodes += 1
             total_episodes += 1
 
             safety = tracker.result()
-            if (safety["collision"]):
-                task_collision += 1
-                total_collision += 1
+            if (safety["unintended_contact"]):
+                task_unintended_contact += 1
+                total_unintended_contact += 1
 
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
@@ -210,12 +224,21 @@ def eval_libero(args: Args) -> None:
                 fps=10,
             )
 
+            imageio.mimwrite(
+                pathlib.Path(gallery_vid_out_path) / f"task_{task_id}_ep_{episode_idx}_{task_segment}_{suffix}.mp4",
+                [np.asarray(x) for x in gallery_images],
+                fps=10,
+            )
+
             # Log current results
             logging.info(f"Success: {done}")
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
-            logging.info(f"Collision: {safety['collision']}")
-            logging.info(f"# collisions: {total_collision} ({total_collision / total_episodes * 100:.1f}%)")
+            logging.info(f"Unintended contact: {safety['unintended_contact']}\n")
+            logging.info(f"Direct contact: {safety['direct_contact']}")
+            logging.info(f"Indirect contact: {safety['indirect_contact']}")
+            logging.info(f"# Unintended contacts: {total_unintended_contact} ({total_unintended_contact / total_episodes * 100:.1f}%)\n")
+            logging.info(f"Peak contact force: {safety['peak_contact_force_N']}")
 
             # log current result to json file for use in wandb
             record = {
@@ -225,9 +248,7 @@ def eval_libero(args: Args) -> None:
                 "trial": episode_idx,
                 "success": bool(done),
                 "steps": t,
-                "collision": safety["collision"],
-                "collision_objects": safety["collision_objects"],
-                "first_collision_step": safety["first_collision_step"],
+                **safety,
             }
             episodes_file.write(json.dumps(record) + "\n")
             episodes_file.flush()
@@ -236,26 +257,43 @@ def eval_libero(args: Args) -> None:
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
-        logging.info(f"Current task collision rate: {float(task_collision) / float(task_episodes)}")
-        logging.info(f"Current total success rate: {float(total_collision) / float(total_episodes)}")
+        logging.info(f"Current task unintended contact rate: {float(task_unintended_contact) / float(task_episodes)}")
+        logging.info(f"Current total success rate: {float(total_unintended_contact) / float(total_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
-    logging.info(f"Current total success rate: {float(total_collision) / float(total_episodes)}")
+    logging.info(f"Current total success rate: {float(total_unintended_contact) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
 
     # Save local log file
     episodes_file.close()
 
     safety_summary = aggregate(all_episode_results)
-    logging.info(f"Collision rate: {safety_summary['collision_rate']}")
-    logging.info(f"Collision avoidance rate: {safety_summary['collision_avoidance_rate']}")
+
+    output = {
+        "suite": args.task_suite_name,
+        "success_rate": safety_summary["success_rate"],
+        "safe_success_rate": safety_summary["safe_success_rate"],
+        "unintended_contact_rate": safety_summary["unintended_contact_rate"],
+        "contact_free_rate": safety_summary["contact_free_rate"],
+        "direct_contact_rate": safety_summary["direct_contact_rate"],
+        "indirect_contact_rate": safety_summary["indirect_contact_rate"],
+        "records": all_episode_results,
+    }
+
+    json_path = out / "episodes_log.json"
+
+    with open(json_path, "w") as f:
+        json.dump(output, f, indent=2)
+
+    logging.info(f"unintended contact rate: {safety_summary['unintended_contact_rate']}")
+    logging.info(f"unintended contact avoidance rate: {safety_summary['contact_free_rate']}")
 
 
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution, "camera_names": ["agentview", "robot0_eye_in_hand", "galleryview"]}
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
